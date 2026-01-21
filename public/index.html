@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Wiki Search</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    input { width: 100%; padding: 12px; font-size: 18px; box-sizing: border-box; }
+    .result { margin: 20px 0; padding: 10px; border-bottom: 1px solid #eee; }
+    .title { font-size: 18px; }
+    .title a { color: #1a0dab; text-decoration: none; }
+    .title a:hover { text-decoration: underline; }
+    .score { color: #666; font-size: 12px; }
+    .snippet { color: #333; margin-top: 5px; }
+    .snippet mark { background: #fff59d; padding: 0 2px; }
+    #status { color: #666; margin: 10px 0; }
+    #pagination { margin: 20px 0; }
+    #pagination button { padding: 8px 16px; margin-right: 8px; cursor: pointer; }
+    #pagination button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <h1>Wiki Search</h1>
+  <input type="text" id="q" placeholder="Search (use quotes for phrases)" autofocus>
+  <div id="status"></div>
+  <div id="results"></div>
+  <div id="pagination"></div>
+
+<script>
+const SHARD_COUNT = 4096;
+const PAGE_SIZE = 10;
+let meta = null;
+let currentResults = [];
+let currentPage = 0;
+let currentTokens = new Set();
+const docCache = new Map(); // docID -> { title, content }
+const docShardCache = new Map(); // shardNum -> Promise<void>
+
+async function init() {
+  const r = await fetch('/index/meta.json');
+  meta = await r.json();
+  document.getElementById('status').textContent = `Loaded: ${meta.docCount} docs, ${meta.shardCount} shards`;
+}
+
+function fnv32a(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function tokenize(s) {
+  return s.toLowerCase().match(/[a-z0-9]+/g) || [];
+}
+
+function parseQuery(q) {
+  const terms = [];
+  const phraseRe = /"([^"]+)"/g;
+  let m;
+  while ((m = phraseRe.exec(q)) !== null) {
+    const toks = tokenize(m[1]);
+    if (toks.length > 0) terms.push({ tokens: toks, isPhrase: true });
+  }
+  const remainder = q.replace(/"[^"]+"/g, '');
+  for (const t of tokenize(remainder)) {
+    terms.push({ tokens: [t], isPhrase: false });
+  }
+  return terms;
+}
+
+function readVarint(dv, offset) {
+  let result = 0, shift = 0;
+  while (true) {
+    const b = dv.getUint8(offset.v++);
+    result |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+  }
+  return result;
+}
+
+
+
+function parseDocShard(buf) {
+  const bytes = new Uint8Array(buf);
+  const dv = new DataView(buf);
+  const decoder = new TextDecoder();
+  let offset = 0;
+
+  const count = dv.getUint32(offset, true);
+  offset += 4;
+
+  for (let i = 0; i < count; i++) {
+    const docID = dv.getUint32(offset, true);
+    offset += 4;
+    const titleLen = dv.getUint16(offset, true);
+    offset += 2;
+    const title = decoder.decode(bytes.subarray(offset, offset + titleLen));
+    offset += titleLen;
+    const contentLen = dv.getUint32(offset, true);
+    offset += 4;
+    const content = decoder.decode(bytes.subarray(offset, offset + contentLen));
+    offset += contentLen;
+    docCache.set(docID, { title, content });
+  }
+}
+
+async function loadDocShard(shardNum) {
+  if (docShardCache.has(shardNum)) {
+    return docShardCache.get(shardNum);
+  }
+  const promise = (async () => {
+    const url = `/docs/shard_${String(shardNum).padStart(5, '0')}.bin`;
+    const r = await fetch(url);
+    parseDocShard(await r.arrayBuffer());
+  })();
+  docShardCache.set(shardNum, promise);
+  return promise;
+}
+
+function parseShard(buf, wantedTokens) {
+  const dv = new DataView(buf);
+  const wanted = new Set(wantedTokens);
+  const result = {};
+  const offset = { v: 0 };
+  const decoder = new TextDecoder();
+
+  while (offset.v < buf.byteLength) {
+    const tokLen = dv.getUint8(offset.v++);
+    const tok = decoder.decode(new Uint8Array(buf, offset.v, tokLen));
+    offset.v += tokLen;
+    const count = dv.getUint32(offset.v, true);
+    offset.v += 4;
+
+    if (!wanted.has(tok)) {
+      for (let i = 0; i < count; i++) {
+        readVarint(dv, offset);
+        const posCount = readVarint(dv, offset);
+        for (let j = 0; j < posCount; j++) readVarint(dv, offset);
+      }
+      continue;
+    }
+
+    const postings = [];
+    let prevDoc = 0;
+    for (let i = 0; i < count; i++) {
+      const docID = prevDoc + readVarint(dv, offset);
+      prevDoc = docID;
+      const posCount = readVarint(dv, offset);
+      const positions = [];
+      let prevPos = 0;
+      for (let j = 0; j < posCount; j++) {
+        const pos = prevPos + readVarint(dv, offset);
+        prevPos = pos;
+        positions.push(pos);
+      }
+      postings.push({ docID, positions });
+    }
+    result[tok] = postings;
+  }
+  return result;
+}
+
+function findAdjacent(pos1, pos2) {
+  const out = [];
+  let i = 0, j = 0;
+  while (i < pos1.length && j < pos2.length) {
+    if (pos1[i] + 1 === pos2[j]) {
+      out.push(pos2[j]);
+      i++; j++;
+    } else if (pos1[i] + 1 < pos2[j]) {
+      i++;
+    } else {
+      j++;
+    }
+  }
+  return out;
+}
+
+function phraseMatch(tokens, postings) {
+  const first = postings[tokens[0]];
+  if (!first) return {};
+  
+  let candidates = {};
+  for (const p of first) candidates[p.docID] = p.positions;
+
+  for (let i = 1; i < tokens.length; i++) {
+    const ps = postings[tokens[i]] || [];
+    const posMap = {};
+    for (const p of ps) posMap[p.docID] = p.positions;
+
+    const newCandidates = {};
+    for (const docID in candidates) {
+      const currPos = posMap[docID];
+      if (!currPos) continue;
+      const adj = findAdjacent(candidates[docID], currPos);
+      if (adj.length > 0) newCandidates[docID] = adj;
+    }
+    candidates = newCandidates;
+  }
+
+  const result = {};
+  for (const docID in candidates) result[docID] = candidates[docID].length;
+  return result;
+}
+
+function highlightText(text, tokens) {
+  if (!tokens.size) return escapeHtml(text);
+  const words = text.split(/(\s+)/);
+  return words.map(w => {
+    const lower = w.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (tokens.has(lower)) {
+      return `<mark>${escapeHtml(w)}</mark>`;
+    }
+    return escapeHtml(w);
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function search() {
+  const q = document.getElementById('q').value.trim();
+  if (!q || !meta) return;
+
+  const terms = parseQuery(q);
+  if (terms.length === 0) return;
+
+  currentTokens = new Set();
+  for (const t of terms) for (const tok of t.tokens) currentTokens.add(tok);
+
+  const shardTokens = {};
+  for (const tok of currentTokens) {
+    const shard = fnv32a(tok) % SHARD_COUNT;
+    if (!shardTokens[shard]) shardTokens[shard] = [];
+    shardTokens[shard].push(tok);
+  }
+
+  const startTime = performance.now();
+  document.getElementById('status').textContent = 'Searching...';
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('pagination').innerHTML = '';
+
+  const postings = {};
+  await Promise.all(Object.keys(shardTokens).map(async (shardID) => {
+    const url = `/index/shard_${String(shardID).padStart(4, '0')}.bin`;
+    const r = await fetch(url);
+    const parsed = parseShard(await r.arrayBuffer(), shardTokens[shardID]);
+    Object.assign(postings, parsed);
+  }));
+
+  const scores = {};
+  for (const term of terms) {
+    if (term.isPhrase && term.tokens.length > 1) {
+      const matches = phraseMatch(term.tokens, postings);
+      const idf = 1 + meta.docCount / (1 + Object.keys(matches).length);
+      for (const docID in matches) {
+        scores[docID] = (scores[docID] || 0) + (1 + matches[docID] * 0.5) * idf * 2;
+      }
+    } else {
+      const tok = term.tokens[0];
+      const ps = postings[tok] || [];
+      const idf = 1 + meta.docCount / (1 + ps.length);
+      for (const p of ps) {
+        const tf = 1 + p.positions.length * 0.5;
+        scores[p.docID] = (scores[p.docID] || 0) + tf * idf;
+      }
+    }
+  }
+
+  currentResults = Object.entries(scores)
+    .map(([docID, score]) => ({ docID: parseInt(docID), score }))
+    .sort((a, b) => b.score - a.score);
+
+  currentPage = 0;
+  const elapsed = (performance.now() - startTime).toFixed(1);
+  document.getElementById('status').textContent = `Found ${currentResults.length} results (${elapsed}ms)`;
+  renderPage();
+}
+
+async function renderPage() {
+  const start = currentPage * PAGE_SIZE;
+  const end = start + PAGE_SIZE;
+  const pageResults = currentResults.slice(start, end);
+
+  // Load all needed doc shards
+  const shardsNeeded = new Set();
+  for (const r of pageResults) {
+    const shardNum = r.docID % meta.docShardCount;
+    shardsNeeded.add(shardNum);
+  }
+  await Promise.all([...shardsNeeded].map(loadDocShard));
+
+  const results = pageResults.map((r) => {
+    const doc = docCache.get(r.docID);
+    if (doc) {
+      return { ...r, title: doc.title, snippet: doc.content.slice(0, 300) };
+    }
+    return { ...r, title: `Doc ${r.docID}`, snippet: '' };
+  });
+
+  document.getElementById('results').innerHTML = results.map((r, i) => {
+    const wikiUrl = `https://simple.wikipedia.org/wiki/${encodeURIComponent(r.title.replace(/ /g, '_'))}`;
+    return `<div class="result">
+      <div class="title">${start + i + 1}. <a href="${wikiUrl}" target="_blank">${highlightText(r.title, currentTokens)}</a></div>
+      <div class="score">Score: ${r.score.toFixed(2)} | Doc ID: ${r.docID}</div>
+      <div class="snippet">${highlightText(r.snippet, currentTokens)}...</div>
+    </div>`;
+  }).join('');
+
+  const totalPages = Math.ceil(currentResults.length / PAGE_SIZE);
+  if (totalPages > 1) {
+    document.getElementById('pagination').innerHTML = `
+      <button onclick="prevPage()" ${currentPage === 0 ? 'disabled' : ''}>Previous</button>
+      <span>Page ${currentPage + 1} of ${totalPages}</span>
+      <button onclick="nextPage()" ${currentPage >= totalPages - 1 ? 'disabled' : ''}>Next</button>
+    `;
+  } else {
+    document.getElementById('pagination').innerHTML = '';
+  }
+}
+
+function prevPage() {
+  if (currentPage > 0) {
+    currentPage--;
+    renderPage();
+  }
+}
+
+function nextPage() {
+  if ((currentPage + 1) * PAGE_SIZE < currentResults.length) {
+    currentPage++;
+    renderPage();
+  }
+}
+
+document.getElementById('q').addEventListener('keyup', (e) => {
+  if (e.key === 'Enter') search();
+});
+
+init();
+</script>
+</body>
+</html>
