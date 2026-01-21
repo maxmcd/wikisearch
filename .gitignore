@@ -1,3 +1,4 @@
 *.txt
 *.bz2
-wiki_index
+public
+.wrangler

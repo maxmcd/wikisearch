@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"compress/bzip2"
-	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
@@ -11,7 +10,6 @@ import (
 	"hash/fnv"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -24,8 +22,15 @@ type Posting struct {
 }
 
 type Meta struct {
-	DocCount   int `json:"docCount"`
-	ShardCount int `json:"shardCount"`
+	DocCount      int `json:"docCount"`
+	ShardCount    int `json:"shardCount"`
+	DocShardCount int `json:"docShardCount"`
+}
+
+type Doc struct {
+	ID      uint32
+	Title   string
+	Content string
 }
 
 type Page struct {
@@ -118,12 +123,35 @@ func main() {
 }
 
 const shardCount = 4096
+const docShardCount = 65536
+
+func writeDocShards(docShards [][]Doc) {
+	for shardNum, docs := range docShards {
+		if len(docs) == 0 {
+			continue
+		}
+		sf, _ := os.Create(fmt.Sprintf("public/docs/shard_%05d.bin", shardNum))
+		bw := bufio.NewWriter(sf)
+
+		binary.Write(bw, binary.LittleEndian, uint32(len(docs)))
+		for _, doc := range docs {
+			binary.Write(bw, binary.LittleEndian, doc.ID)
+			binary.Write(bw, binary.LittleEndian, uint16(len(doc.Title)))
+			bw.WriteString(doc.Title)
+			binary.Write(bw, binary.LittleEndian, uint32(len(doc.Content)))
+			bw.WriteString(doc.Content)
+		}
+
+		bw.Flush()
+		sf.Close()
+	}
+}
 
 func buildIndex(dumpPath string) {
-	os.RemoveAll("wiki_index/docs")
-	os.RemoveAll("wiki_index/index")
-	os.MkdirAll("wiki_index/docs", 0755)
-	os.MkdirAll("wiki_index/index", 0755)
+	os.RemoveAll("public/docs")
+	os.RemoveAll("public/index")
+	os.MkdirAll("public/docs", 0755)
+	os.MkdirAll("public/index", 0755)
 
 	f, _ := os.Open(dumpPath)
 	defer f.Close()
@@ -132,6 +160,7 @@ func buildIndex(dumpPath string) {
 	for i := range shards {
 		shards[i] = make(map[string][]Posting)
 	}
+	docShards := make([][]Doc, docShardCount)
 	docCount := 0
 
 	decoder := xml.NewDecoder(bzip2.NewReader(f))
@@ -151,9 +180,8 @@ func buildIndex(dumpPath string) {
 		}
 
 		text := stripWikitext(page.Text)
-		docPath := fmt.Sprintf("wiki_index/docs/%04d", page.ID%100)
-		os.MkdirAll(docPath, 0755)
-		os.WriteFile(filepath.Join(docPath, fmt.Sprintf("%d.txt", page.ID)), []byte(page.Title+"\n"+text), 0644)
+		docShard := page.ID % docShardCount
+		docShards[docShard] = append(docShards[docShard], Doc{ID: page.ID, Title: page.Title, Content: text})
 
 		tokens := tokenize(text)
 		positions := make(map[string][]uint32)
@@ -171,12 +199,14 @@ func buildIndex(dumpPath string) {
 		}
 	}
 
+	fmt.Printf("total: %d docs, writing doc shards...\n", docCount)
+	writeDocShards(docShards)
+
 	fmt.Printf("total: %d docs, writing shards...\n", docCount)
 
 	for i, shard := range shards {
-		sf, _ := os.Create(fmt.Sprintf("wiki_index/index/shard_%04d.bin.gz", i))
-		gw := gzip.NewWriter(sf)
-		bw := bufio.NewWriter(gw)
+		sf, _ := os.Create(fmt.Sprintf("public/index/shard_%04d.bin", i))
+		bw := bufio.NewWriter(sf)
 
 		tokens := make([]string, 0, len(shard))
 		for t := range shard {
@@ -204,12 +234,11 @@ func buildIndex(dumpPath string) {
 			}
 		}
 		bw.Flush()
-		gw.Close()
 		sf.Close()
 	}
 
-	mf, _ := os.Create("wiki_index/index/meta.json")
-	json.NewEncoder(mf).Encode(Meta{DocCount: docCount, ShardCount: shardCount})
+	mf, _ := os.Create("public/index/meta.json")
+	json.NewEncoder(mf).Encode(Meta{DocCount: docCount, ShardCount: shardCount, DocShardCount: docShardCount})
 	mf.Close()
 	fmt.Println("done")
 }
